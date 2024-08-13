@@ -13,6 +13,9 @@ from transformer_lens.hook_points import HookPoint
 
 from abliterator.chat_template import LLAMA3_CHAT_TEMPLATE, ChatTemplate
 from abliterator.data import prepare_dataset
+from abliterator.util import batch, clear_mem, measure_fn
+
+DEFAULT_ACTIVATION_LAYERS = ("resid_pre", "resid_post", "mlp_out", "attn_out")
 
 
 class ModelAbliterator:
@@ -21,19 +24,15 @@ class ModelAbliterator:
         model: str,
         dataset: tuple[list[str], list[str]] | list[tuple[list[str], list[str]]],
         device: str = "cuda",
-        n_devices: int = None,
-        cache_fname: str = None,
-        activation_layers: list[str] = [
-            "resid_pre",
-            "resid_post",
-            "mlp_out",
-            "attn_out",
-        ],
-        chat_template: str = None,
+        n_devices: int | None = None,
+        cache_fname: str | None = None,
+        activation_layers: list[str] | None = None,
+        chat_template: str | None = None,
         positive_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
         negative_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
     ):
         self.MODEL_PATH = model
+        activation_layers = activation_layers or list(DEFAULT_ACTIVATION_LAYERS)
         if n_devices is None and torch.cuda.is_available():
             n_devices = torch.cuda.device_count()
         elif n_devices is None:
@@ -163,7 +162,7 @@ class ModelAbliterator:
         return [l for l in range(self.model.cfg.n_layers) if l not in self._blacklisted]
 
     def get_all_act_names(
-        self, activation_layers: list[str] = None
+        self, activation_layers: list[str] | None = None
     ) -> list[tuple[int, str]]:
         return [
             (i, utils.get_act_name(act_name, i))
@@ -236,7 +235,7 @@ class ModelAbliterator:
         )
 
     def get_layer_dirs(
-        self, layer, key: str = None, include_overall_mean: bool = False
+        self, layer, key: str | None = None, include_overall_mean: bool = False
     ) -> dict[str, Float[Tensor, "d_model"]]:
         act_key = key or self.activation_layers[0]
         if len(self.harmfuls[key]) < layer:
@@ -299,11 +298,12 @@ class ModelAbliterator:
             self.model.blocks[layer].attn.W_O.data = replacement.to(
                 self.model.blocks[layer].attn.W_O.device
             )
-            self.modified_layers["W_O"][layer] = self.modified_layers.get(layer, []) + [
+            self.modified_layers["W_O"][layer] = [
+                *self.modified_layers.get(layer, []),
                 (
                     self.model.blocks[layer].attn.W_O.data.to("cpu"),
                     replacement.to("cpu"),
-                )
+                ),
             ]
         return self.model.blocks[layer].attn.W_O.data
 
@@ -316,11 +316,12 @@ class ModelAbliterator:
             self.model.blocks[layer].mlp.W_out.data = replacement.to(
                 self.model.blocks[layer].mlp.W_out.device
             )
-            self.modified_layers["mlp"][layer] = self.modified_layers.get(layer, []) + [
+            self.modified_layers["mlp"][layer] = [
+                *self.modified_layers.get(layer, []),
                 (
                     self.model.blocks[layer].mlp.W_out.data.to("cpu"),
                     replacement.to("cpu"),
-                )
+                ),
             ]
         return self.model.blocks[layer].mlp.W_out.data
 
@@ -353,7 +354,7 @@ class ModelAbliterator:
             device=toks.device,
         )
         all_toks[:, : toks.shape[1]] = toks
-        generating = [i for i in range(toks.shape[0])]
+        generating = list(range(toks.shape[0]))
         for i in range(max_tokens_generated):
             logits = self.model(
                 all_toks[generating, : -max_tokens_generated + i], *args, **kwargs
@@ -402,7 +403,7 @@ class ModelAbliterator:
     def test(
         self,
         *args,
-        test_set: list[str] = None,
+        test_set: list[str] | None = None,
         N: int = 16,
         batch_size: int = 4,
         **kwargs,
@@ -410,25 +411,26 @@ class ModelAbliterator:
         if test_set is None:
             test_set = self.harmful_inst_test
         for prompts in batch(test_set[: min(len(test_set), N)], batch_size):
-            for i, res in enumerate(self.generate(prompts, *args, **kwargs)):
+            for res in self.generate(prompts, *args, **kwargs):
                 print(res)
 
     def run_with_cache(
         self,
         *model_args,
-        names_filter: Callable[[str], bool] = None,
+        names_filter: Callable[[str], bool] | None = None,
         incl_bwd: bool = False,
-        device: str = None,
+        device: str | None = None,
         remove_batch_dim: bool = False,
         reset_hooks_end: bool = True,
         clear_contexts: bool = False,
-        fwd_hooks: list[str] = [],
+        fwd_hooks: list[str] | None = None,
         max_new_tokens: int = 1,
         **model_kwargs,
     ) -> tuple[
         Float[Tensor, "batch_size seq_len d_vocab"],
         dict[str, Float[Tensor, "batch_size seq_len d_model"]],
     ]:
+        fwd_hooks = fwd_hooks or []
         if names_filter is None and self.activation_layers:
 
             def activation_layering(namefunc: str):
@@ -470,30 +472,31 @@ class ModelAbliterator:
         refusal_dirs: list[Float[Tensor, "d_model"]],
         W_O: bool = True,
         mlp: bool = True,
-        layers: list[str] = None,
+        layers: list[str] | None = None,
     ):
         if layers is None:
-            layers = list(l for l in range(1, self.model.cfg.n_layers))
+            layers = list(range(1, self.model.cfg.n_layers))
         for refusal_dir in refusal_dirs:
             for layer in layers:
                 for modifying in [(W_O, self.layer_attn), (mlp, self.layer_mlp)]:
-                    if modifying[0]:
-                        matrix = modifying[1](layer)
-                        if refusal_dir.device != matrix.device:
-                            refusal_dir = refusal_dir.to(matrix.device)
-                        proj = self.calculate_scaled_projection(matrix, refusal_dir)
-                        modifying[1](layer, matrix - proj)
+                    if not modifying[0]:
+                        continue
+                    matrix = modifying[1](layer)
+                    if refusal_dir.device != matrix.device:
+                        refusal_dir = refusal_dir.to(matrix.device)
+                    proj = self.calculate_scaled_projection(matrix, refusal_dir)
+                    modifying[1](layer, matrix - proj)
 
     def induce_refusal_dir(
         self,
         refusal_dir: Float[Tensor, "d_model"],
         W_O: bool = True,
         mlp: bool = True,
-        layers: list[str] = None,
+        layers: list[str] | None = None,
     ):
         # incomplete, needs work
         if layers is None:
-            layers = list(l for l in range(1, self.model.cfg.n_layers))
+            layers = list(range(1, self.model.cfg.n_layers))
         for layer in layers:
             for modifying in [(W_O, self.layer_attn), (mlp, self.layer_mlp)]:
                 if modifying[0]:
@@ -510,9 +513,9 @@ class ModelAbliterator:
     def test_dir(
         self,
         refusal_dir: Float[Tensor, "d_model"],
-        activation_layers: list[str] = None,
+        activation_layers: list[str] | None = None,
         use_hooks: bool = True,
-        layers: list[str] = None,
+        layers: list[str] | None = None,
         **kwargs,
     ) -> dict[str, Float[Tensor, "d_model"]]:
         # `use_hooks=True` is better for bigger models as it causes a lot of memory swapping otherwise, but
@@ -745,11 +748,11 @@ class ModelAbliterator:
         batch_size: int = 8,
         last_indices: int = 1,
         measure_refusal: int = 0,
-        stop_at_layer: int = None,
+        stop_at_layer: int | None = None,
     ) -> tuple[ActivationCache, list[str]]:
         # Base functionality for creating an activation cache with a training set, prefer 'cache_activations' for regular usage
 
-        base = dict()
+        base = {}
         z_label = [] if measure_refusal > 1 else None
         for i in tqdm(range(0, min(N, len(toks)), batch_size)):
             logits, cache = self.run_with_cache(
@@ -788,7 +791,7 @@ class ModelAbliterator:
         reset: bool = True,
         activation_layers: int = -1,
         preserve_harmless: bool = True,
-        stop_at_layer: int = None,
+        stop_at_layer: int | None = None,
     ):
         if hasattr(self, "current_state"):
             print("WARNING: Caching activations using a context")
