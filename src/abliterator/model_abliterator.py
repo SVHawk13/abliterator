@@ -10,7 +10,7 @@ from torch import Tensor
 from tqdm import tqdm
 from transformer_lens import ActivationCache, HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
-
+from transformers import AutoModelForCausalLM
 from abliterator.chat_template import LLAMA3_CHAT_TEMPLATE, ChatTemplate
 from abliterator.data import prepare_dataset
 from abliterator.util import batch, clear_mem, measure_fn
@@ -30,7 +30,9 @@ class ModelAbliterator:
         chat_template: str | None = None,
         positive_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
         negative_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
-    ):
+        dtype: torch.dtype | str | None = None,
+        hf_model: AutoModelForCausalLM | None = None,
+    ) -> None:
         self.MODEL_PATH = model
         activation_layers = activation_layers or list(DEFAULT_ACTIVATION_LAYERS)
         if n_devices is None and torch.cuda.is_available():
@@ -41,13 +43,16 @@ class ModelAbliterator:
         # Save memory
         torch.set_grad_enabled(False)
 
-        self.model = HookedTransformer.from_pretrained_no_processing(
-            model,
-            n_devices=n_devices,
-            device=device,
-            dtype=torch.bfloat16,
-            default_padding_side="left",
-        )
+        model_options = {
+            "model_name": model,
+            "n_devices": n_devices,
+            "device": device,
+            "dtype": dtype or "float32",
+            "default_padding_side": "left",
+            "hf_model": hf_model
+        }
+
+        self.model = HookedTransformer.from_pretrained_no_processing(**model_options)
 
         self.model.requires_grad_(False)
 
