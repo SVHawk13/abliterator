@@ -1,0 +1,39 @@
+line-length = 88
+indent-width = 4
+
+[lint]
+extend-select = [
+    "ASYNC",
+    "ASYNC1",
+    "B",
+    "C4",
+    "C90",
+    "E",
+    "I",
+    "ICN",
+    "Q",
+    "RUF",
+    "S",
+    "TRY",
+    "W",
+]
+ignore = [
+    "COM812",
+    "COM819",
+    "D206",
+    "D300",
+    "E111",
+    "E114",
+    "E117",
+    "ISC001",
+    "ISC002",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "S101",
+    "W191",
+]
+
+[lint.mccabe]
+max-complexity = 10
