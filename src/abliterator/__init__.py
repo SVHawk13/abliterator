@@ -2,6 +2,7 @@ from abliterator.chat_template import (
     LLAMA3_CHAT_TEMPLATE,
     PHI3_CHAT_TEMPLATE,
     ChatTemplate,
+    TokenizerChatTemplate,
 )
 from abliterator.data import (
     get_harmful_instructions,
@@ -15,6 +16,7 @@ __all__ = [
     "LLAMA3_CHAT_TEMPLATE",
     "PHI3_CHAT_TEMPLATE",
     "ChatTemplate",
+    "TokenizerChatTemplate",
     "get_harmful_instructions",
     "get_harmless_instructions",
     "prepare_dataset",

@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformer_lens import ActivationCache, HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
 from transformers import AutoModelForCausalLM
+
 from abliterator.chat_template import LLAMA3_CHAT_TEMPLATE, ChatTemplate
 from abliterator.data import prepare_dataset
 from abliterator.util import batch, clear_mem, measure_fn
@@ -49,7 +50,7 @@ class ModelAbliterator:
             "device": device,
             "dtype": dtype or "float32",
             "default_padding_side": "left",
-            "hf_model": hf_model
+            "hf_model": hf_model,
         }
 
         self.model = HookedTransformer.from_pretrained_no_processing(**model_options)
