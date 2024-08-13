@@ -1,128 +1,37 @@
 import functools
-import gc
 import re
-from itertools import islice
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Callable
 
 import einops
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 from jaxtyping import Float, Int
-from sklearn.model_selection import train_test_split
 from torch import Tensor
 from tqdm import tqdm
-from transformer_lens import ActivationCache, HookedTransformer, loading, utils
+from transformer_lens import ActivationCache, HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-def batch(iterable, n):
-    it = iter(iterable)
-    while True:
-        chunk = list(islice(it, n))
-        if not chunk:
-            break
-        yield chunk
-
-
-def get_harmful_instructions() -> Tuple[List[str], List[str]]:
-    hf_path = "Undi95/orthogonal-activation-steering-TOXIC"
-    dataset = load_dataset(hf_path)
-    instructions = [i["goal"] for i in dataset["test"]]
-
-    train, test = train_test_split(instructions, test_size=0.2, random_state=42)
-    return train, test
-
-
-def get_harmless_instructions() -> Tuple[List[str], List[str]]:
-    hf_path = "tatsu-lab/alpaca"
-    dataset = load_dataset(hf_path)
-    # filter for instructions that do not have inputs
-    instructions = []
-    for i in range(len(dataset["train"])):
-        if dataset["train"][i]["input"].strip() == "":
-            instructions.append(dataset["train"][i]["instruction"])
-
-    train, test = train_test_split(instructions, test_size=0.2, random_state=42)
-    return train, test
-
-
-def prepare_dataset(
-    dataset: Tuple[List[str], List[str]] | List[str],
-) -> Tuple[List[str], List[str]]:
-    if len(dataset) != 2:
-        # assumed to not be split into train/test
-        train, test = train_test_split(dataset, test_size=0.1, random_state=42)
-    else:
-        train, test = dataset
-
-    return train, test
-
-
-def clear_mem():
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def measure_fn(
-    measure: str, input_tensor: Tensor, *args, **kwargs
-) -> Float[Tensor, "..."]:
-    avail_measures = {
-        "mean": torch.mean,
-        "median": torch.median,
-        "max": torch.max,
-        "stack": torch.stack,
-    }
-
-    try:
-        return avail_measures[measure](input_tensor, *args, **kwargs)
-    except KeyError:
-        raise NotImplementedError(
-            f"Unknown measure function '{measure}'. Available measures:"
-            + ", ".join([f"'{str(fn)}'" for fn in avail_measures.keys()])
-        )
-
-
-class ChatTemplate:
-    def __init__(self, model, template):
-        self.model = model
-        self.template = template
-
-    def format(self, instruction):
-        return self.template.format(instruction=instruction)
-
-    def __enter__(self):
-        self.prev = self.model.chat_template
-        self.model.chat_template = self
-        return self
-
-    def __exit__(self, exc, exc_value, exc_tb):
-        self.model.chat_template = self.prev
-        del self.prev
-
-
-LLAMA3_CHAT_TEMPLATE = """<|start_header_id|>user<|end_header_id|>\n{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
-PHI3_CHAT_TEMPLATE = """<|user|>\n{instruction}<|end|>\n<|assistant|>"""
+from abliterator.chat_template import LLAMA3_CHAT_TEMPLATE, ChatTemplate
+from abliterator.data import prepare_dataset
 
 
 class ModelAbliterator:
     def __init__(
         self,
         model: str,
-        dataset: Tuple[List[str], List[str]] | List[Tuple[List[str], List[str]]],
+        dataset: tuple[list[str], list[str]] | list[tuple[list[str], list[str]]],
         device: str = "cuda",
         n_devices: int = None,
         cache_fname: str = None,
-        activation_layers: List[str] = [
+        activation_layers: list[str] = [
             "resid_pre",
             "resid_post",
             "mlp_out",
             "attn_out",
         ],
         chat_template: str = None,
-        positive_toks: List[int] | Tuple[int] | Set[int] | Int[Tensor, "..."] = None,
-        negative_toks: List[int] | Tuple[int] | Set[int] | Int[Tensor, "..."] = None,
+        positive_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
+        negative_toks: list[int] | tuple[int] | set[int] | Int[Tensor, "..."] = None,
     ):
         self.MODEL_PATH = model
         if n_devices is None and torch.cuda.is_available():
@@ -223,14 +132,14 @@ class ModelAbliterator:
 
     # Utility functions
 
-    def blacklist_layer(self, layer: int | List[int]):
+    def blacklist_layer(self, layer: int | list[int]):
         # Prevents a layer from being modified
         if isinstance(layer, list):
             self._blacklisted.update(layer)
         else:
             self._blacklisted.add(layer)
 
-    def whitelist_layer(self, layer: int | List[int]):
+    def whitelist_layer(self, layer: int | list[int]):
         # Removes layer from blacklist to allow modification
         if isinstance(layer, list):
             self._blacklisted.difference_update(layer)
@@ -250,12 +159,12 @@ class ModelAbliterator:
             fname,
         )
 
-    def get_whitelisted_layers(self) -> List[int]:
+    def get_whitelisted_layers(self) -> list[int]:
         return [l for l in range(self.model.cfg.n_layers) if l not in self._blacklisted]
 
     def get_all_act_names(
-        self, activation_layers: List[str] = None
-    ) -> List[Tuple[int, str]]:
+        self, activation_layers: list[str] = None
+    ) -> list[tuple[int, str]]:
         return [
             (i, utils.get_act_name(act_name, i))
             for i in self.get_whitelisted_layers()
@@ -264,7 +173,7 @@ class ModelAbliterator:
 
     def calculate_mean_dirs(
         self, key: str, include_overall_mean: bool = False
-    ) -> Dict[str, Float[Tensor, "d_model"]]:
+    ) -> dict[str, Float[Tensor, "d_model"]]:
         dirs = {
             "harmful_mean": torch.mean(self.harmful[key], dim=0),
             "harmless_mean": torch.mean(self.harmless[key], dim=0),
@@ -319,7 +228,7 @@ class ModelAbliterator:
 
     def get_avg_projections(
         self, key: str, direction: Float[Tensor, "d_model"]
-    ) -> Tuple[Float[Tensor, "d_model"], Float[Tensor, "d_model"]]:
+    ) -> tuple[Float[Tensor, "d_model"], Float[Tensor, "d_model"]]:
         dirs = self.calculate_mean_dirs(self, key)
         return (
             torch.dot(dirs["harmful_mean"], direction),
@@ -328,7 +237,7 @@ class ModelAbliterator:
 
     def get_layer_dirs(
         self, layer, key: str = None, include_overall_mean: bool = False
-    ) -> Dict[str, Float[Tensor, "d_model"]]:
+    ) -> dict[str, Float[Tensor, "d_model"]]:
         act_key = key or self.activation_layers[0]
         if len(self.harmfuls[key]) < layer:
             raise IndexError("Invalid layer")
@@ -347,7 +256,7 @@ class ModelAbliterator:
             direction = direction.to(activation.device)
         return self.calculate_ortho_complement(activation, direction)
 
-    def refusal_dirs(self, invert: bool = False) -> Dict[str, Float[Tensor, "d_model"]]:
+    def refusal_dirs(self, invert: bool = False) -> dict[str, Float[Tensor, "d_model"]]:
         if not self.harmful:
             raise IndexError("No cache")
 
@@ -369,7 +278,7 @@ class ModelAbliterator:
 
         return {key: (v / v.norm()).to("cpu") for key, v in refusal_dirs.items()}
 
-    def scored_dirs(self, invert=False) -> List[Tuple[str, Float[Tensor, "d_model"]]]:
+    def scored_dirs(self, invert=False) -> list[tuple[str, Float[Tensor, "d_model"]]]:
         refusals = self.refusal_dirs(invert=invert)
         return sorted(
             [(ln, refusals[act_name]) for ln, act_name in self.get_all_act_names()],
@@ -416,7 +325,7 @@ class ModelAbliterator:
         return self.model.blocks[layer].mlp.W_out.data
 
     def tokenize_instructions_fn(
-        self, instructions: List[str]
+        self, instructions: list[str]
     ) -> Int[Tensor, "batch_size seq_len"]:
         prompts = [
             self.chat_template.format(instruction=instruction)
@@ -434,7 +343,7 @@ class ModelAbliterator:
         stop_at_eos: bool = False,
         max_tokens_generated: int = 1,
         **kwargs,
-    ) -> Tuple[
+    ) -> tuple[
         Float[Tensor, "batch_size seq_len d_vocab"], Int[Tensor, "batch_size seq_len"]
     ]:
         # does most of the model magic
@@ -469,12 +378,12 @@ class ModelAbliterator:
 
     def generate(
         self,
-        prompt: List[str] | str,
+        prompt: list[str] | str,
         *model_args,
         max_tokens_generated: int = 64,
         stop_at_eos: bool = True,
         **model_kwargs,
-    ) -> List[str]:
+    ) -> list[str]:
         # convenience function to test manual prompts, no caching
         if type(prompt) is str:
             gen = self.tokenize_instructions_fn([prompt])
@@ -493,7 +402,7 @@ class ModelAbliterator:
     def test(
         self,
         *args,
-        test_set: List[str] = None,
+        test_set: list[str] = None,
         N: int = 16,
         batch_size: int = 4,
         **kwargs,
@@ -513,12 +422,12 @@ class ModelAbliterator:
         remove_batch_dim: bool = False,
         reset_hooks_end: bool = True,
         clear_contexts: bool = False,
-        fwd_hooks: List[str] = [],
+        fwd_hooks: list[str] = [],
         max_new_tokens: int = 1,
         **model_kwargs,
-    ) -> Tuple[
+    ) -> tuple[
         Float[Tensor, "batch_size seq_len d_vocab"],
-        Dict[str, Float[Tensor, "batch_size seq_len d_model"]],
+        dict[str, Float[Tensor, "batch_size seq_len d_model"]],
     ]:
         if names_filter is None and self.activation_layers:
 
@@ -558,10 +467,10 @@ class ModelAbliterator:
 
     def apply_refusal_dirs(
         self,
-        refusal_dirs: List[Float[Tensor, "d_model"]],
+        refusal_dirs: list[Float[Tensor, "d_model"]],
         W_O: bool = True,
         mlp: bool = True,
-        layers: List[str] = None,
+        layers: list[str] = None,
     ):
         if layers is None:
             layers = list(l for l in range(1, self.model.cfg.n_layers))
@@ -580,7 +489,7 @@ class ModelAbliterator:
         refusal_dir: Float[Tensor, "d_model"],
         W_O: bool = True,
         mlp: bool = True,
-        layers: List[str] = None,
+        layers: list[str] = None,
     ):
         # incomplete, needs work
         if layers is None:
@@ -601,11 +510,11 @@ class ModelAbliterator:
     def test_dir(
         self,
         refusal_dir: Float[Tensor, "d_model"],
-        activation_layers: List[str] = None,
+        activation_layers: list[str] = None,
         use_hooks: bool = True,
-        layers: List[str] = None,
+        layers: list[str] = None,
         **kwargs,
-    ) -> Dict[str, Float[Tensor, "d_model"]]:
+    ) -> dict[str, Float[Tensor, "d_model"]]:
         # `use_hooks=True` is better for bigger models as it causes a lot of memory swapping otherwise, but
         # `use_hooks=False` is much more representative of the final weights manipulation
 
@@ -639,7 +548,7 @@ class ModelAbliterator:
         positive: bool = False,
         use_hooks: bool = True,
         invert: bool = False,
-    ) -> List[Tuple[float, str]]:
+    ) -> list[tuple[float, str]]:
         dirs = self.refusal_dirs(invert=invert)
         if self.modified:
             print(
@@ -658,7 +567,7 @@ class ModelAbliterator:
         measure: str = "max",
         batch_measure: str = "max",
         positive: bool = False,
-    ) -> Dict[str, Float[Tensor, "d_model"]]:
+    ) -> dict[str, Float[Tensor, "d_model"]]:
         toks = self.tokenize_instructions_fn(instructions=self.harmful_inst_test[:N])
         logits, cache = self.run_with_cache(
             toks, max_new_tokens=sampled_token_ct, drop_refusals=False
@@ -680,7 +589,7 @@ class ModelAbliterator:
         logits: Float[Tensor, "batch_size seq_len d_vocab"],
         sequence: int,
         measure: str = "max",
-    ) -> Tuple[Float[Tensor, "batch_size"], Float[Tensor, "batch_size"]]:
+    ) -> tuple[Float[Tensor, "batch_size"], Float[Tensor, "batch_size"]]:
         normalized_scores = torch.softmax(logits[:, -sequence:, :].to("cpu"), dim=-1)[
             :, :, list(self.positive_toks) + list(self.negative_toks)
         ]
@@ -702,10 +611,10 @@ class ModelAbliterator:
 
     def do_resid(
         self, fn_name: str
-    ) -> Tuple[
+    ) -> tuple[
         Float[Tensor, "layer batch d_model"],
         Float[Tensor, "layer batch d_model"],
-        List[str],
+        list[str],
     ]:
         if not any("resid" in k for k in self.harmless.keys()):
             raise AssertionError(
@@ -720,19 +629,19 @@ class ModelAbliterator:
 
     def decomposed_resid(
         self,
-    ) -> Tuple[
+    ) -> tuple[
         Float[Tensor, "layer batch d_model"],
         Float[Tensor, "layer batch d_model"],
-        List[str],
+        list[str],
     ]:
         return self.do_resid("decompose_resid")
 
     def accumulated_resid(
         self,
-    ) -> Tuple[
+    ) -> tuple[
         Float[Tensor, "layer batch d_model"],
         Float[Tensor, "layer batch d_model"],
-        List[str],
+        list[str],
     ]:
         return self.do_resid("accumulated_resid")
 
@@ -755,10 +664,10 @@ class ModelAbliterator:
 
     def create_layer_rankings(
         self,
-        token_set: List[int] | Set[int] | Int[Tensor, "..."],
+        token_set: list[int] | set[int] | Int[Tensor, "..."],
         decompose: bool = True,
-        token_set_b: List[int] | Set[int] | Int[Tensor, "..."] = None,
-    ) -> List[Tuple[int, int]]:
+        token_set_b: list[int] | set[int] | Int[Tensor, "..."] = None,
+    ) -> list[tuple[int, int]]:
         decomposer = self.decomposed_resid if decompose else self.accumulated_resid
 
         decomposed_resid_harmful, decomposed_resid_harmless, labels = decomposer()
@@ -788,7 +697,7 @@ class ModelAbliterator:
 
     def mse_positive(
         self, N: int = 128, batch_size: int = 8, last_indices: int = 1
-    ) -> Dict[str, Float[Tensor, "d_model"]]:
+    ) -> dict[str, Float[Tensor, "d_model"]]:
         # Calculate mean squared error against currently loaded negative cached activation
         # Idea being to get a general sense of how the "normal" direction has been altered.
         # This is to compare ORIGINAL functionality to ABLATED functionality, not for ground truth.
@@ -837,7 +746,7 @@ class ModelAbliterator:
         last_indices: int = 1,
         measure_refusal: int = 0,
         stop_at_layer: int = None,
-    ) -> Tuple[ActivationCache, List[str]]:
+    ) -> tuple[ActivationCache, list[str]]:
         # Base functionality for creating an activation cache with a training set, prefer 'cache_activations' for regular usage
 
         base = dict()
