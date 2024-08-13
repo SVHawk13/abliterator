@@ -1,20 +1,20 @@
-import torch
-import torch.nn.functional as F
 import functools
-import einops
 import gc
 import re
 from itertools import islice
-
-from datasets import load_dataset
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from torch import Tensor
 from typing import Callable, Dict, List, Set, Tuple
-from transformer_lens import HookedTransformer, utils, ActivationCache, loading
-from transformer_lens.hook_points import HookPoint
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+import einops
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
 from jaxtyping import Float, Int
+from sklearn.model_selection import train_test_split
+from torch import Tensor
+from tqdm import tqdm
+from transformer_lens import ActivationCache, HookedTransformer, loading, utils
+from transformer_lens.hook_points import HookPoint
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def batch(iterable, n):
@@ -168,9 +168,11 @@ class ModelAbliterator:
         self.fwd_hooks = []
         self.modified = False
         self.activation_layers = (
-            [activation_layers] if type(activation_layers) == str else activation_layers
+            [activation_layers]
+            if isinstance(activation_layers, str)
+            else activation_layers
         )
-        if negative_toks == None:
+        if negative_toks is None:
             print(
                 "WARNING: You've not set 'negative_toks', defaulting to tokens for Llama-3 vocab"
             )
@@ -185,7 +187,7 @@ class ModelAbliterator:
             }  # llama-3 refusal tokens e.g. ' cannot', ' unethical', ' sorry'
         else:
             self.negative_toks = negative_toks
-        if positive_toks == None:
+        if positive_toks is None:
             print(
                 "WARNING: You've not set 'positive_toks', defaulting to tokens for Llama-3 vocab"
             )
@@ -223,17 +225,15 @@ class ModelAbliterator:
 
     def blacklist_layer(self, layer: int | List[int]):
         # Prevents a layer from being modified
-        if type(layer) is list:
-            for l in layer:
-                self._blacklisted.add(l)
+        if isinstance(layer, list):
+            self._blacklisted.update(layer)
         else:
             self._blacklisted.add(layer)
 
     def whitelist_layer(self, layer: int | List[int]):
         # Removes layer from blacklist to allow modification
-        if type(layer) is list:
-            for l in layer:
-                self._blacklisted.discard(l)
+        if isinstance(layer, list):
+            self._blacklisted.difference_update(layer)
         else:
             self._blacklisted.discard(layer)
 
@@ -563,7 +563,7 @@ class ModelAbliterator:
         mlp: bool = True,
         layers: List[str] = None,
     ):
-        if layers == None:
+        if layers is None:
             layers = list(l for l in range(1, self.model.cfg.n_layers))
         for refusal_dir in refusal_dirs:
             for layer in layers:
@@ -583,7 +583,7 @@ class ModelAbliterator:
         layers: List[str] = None,
     ):
         # incomplete, needs work
-        if layers == None:
+        if layers is None:
             layers = list(l for l in range(1, self.model.cfg.n_layers))
         for layer in layers:
             for modifying in [(W_O, self.layer_attn), (mlp, self.layer_mlp)]:
@@ -740,7 +740,7 @@ class ModelAbliterator:
         self, resid: Float[Tensor, "layer batch d_model"], pos: int = -1
     ) -> Float[Tensor, "layer batch d_vocab"]:
         W_U = self.model.W_U
-        if pos == None:
+        if pos is None:
             return einops.einsum(
                 resid.to(W_U.device),
                 W_U,
@@ -892,7 +892,7 @@ class ModelAbliterator:
         harmless_is_set = len(getattr(self, "harmless", {})) > 0
         preserve_harmless = harmless_is_set and preserve_harmless
 
-        if reset == True or getattr(self, "harmless", None) is None:
+        if reset is True or getattr(self, "harmless", None) is None:
             self.harmful = {}
             if not preserve_harmless:
                 self.harmless = {}
